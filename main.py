@@ -12,10 +12,9 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTreeView, QFileSystemModel, QSplitter, QTextEdit, QLabel, QPushButton,
     QTabWidget, QMessageBox, QTableWidget, QTableWidgetItem, QLineEdit,
-    QHeaderView, QSizePolicy, QScrollArea, QStyle, QFileDialog, QListWidget, QListWidgetItem,
-    QProgressDialog, QGridLayout # THAY ĐỔI: Thêm QGridLayout và QProgressDialog
+    QHeaderView, QSizePolicy, QScrollArea, QStyle, QFileDialog, QListWidget, QListWidgetItem 
 )
-from PySide6.QtCore import Qt, QDir, QSize, Signal, QObject, QModelIndex, QTimer, QRect, QCoreApplication # THAY ĐỔI: Thêm QCoreApplication
+from PySide6.QtCore import Qt, QDir, QSize, Signal, QObject, QModelIndex, QTimer, QRect 
 from PySide6.QtGui import QPixmap, QImage, QIcon 
 
 # optional libs
@@ -32,11 +31,8 @@ except Exception:
 
 try:
     from docx import Document
-    from docx.shared import RGBColor # THÊM: Để chỉnh màu chữ
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
 except Exception:
     Document = None
-    RGBColor = None
 
 import openpyxl
 
@@ -652,12 +648,9 @@ class ContractTemplateWidget(QWidget):
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setStyleSheet("QScrollArea { border: none; background-color: transparent; }")
-        
         h_container = QWidget()
         h_container.setStyleSheet("QWidget { background-color: transparent; }") 
-        
-        # THAY ĐỔI: Sử dụng QGridLayout để Card tự động xuống dòng
-        self.layout = QGridLayout(h_container) 
+        self.layout = QHBoxLayout(h_container) 
         self.layout.setAlignment(Qt.AlignLeft | Qt.AlignTop) 
         scroll_area.setWidget(h_container)
         
@@ -666,19 +659,14 @@ class ContractTemplateWidget(QWidget):
         self.load_templates()
 
     def load_templates(self):
-        # THAY ĐỔI: Dọn dẹp QGridLayout
-        for i in reversed(range(self.layout.count())): 
-            item = self.layout.itemAt(i)
+        while self.layout.count():
+            item = self.layout.takeAt(0)
             widget = item.widget()
             if widget:
                 widget.deleteLater()
         
         if not os.path.isdir(CONTRACT_TEMPLATE_PATH):
-            temp_layout = QVBoxLayout()
-            temp_layout.addWidget(QLabel(f"Không tìm thấy thư mục mẫu hợp đồng: {CONTRACT_TEMPLATE_PATH}"))
-            temp_widget = QWidget()
-            temp_widget.setLayout(temp_layout)
-            self.layout.addWidget(temp_widget, 0, 0)
+            self.layout.addWidget(QLabel(f"Không tìm thấy thư mục mẫu hợp đồng: {CONTRACT_TEMPLATE_PATH}"))
             return
 
         all_files = os.listdir(CONTRACT_TEMPLATE_PATH) 
@@ -690,20 +678,12 @@ class ContractTemplateWidget(QWidget):
         ]
 
         if not template_files:
-            temp_layout = QVBoxLayout()
-            temp_layout.addWidget(QLabel("Không có file mẫu (.doc, .docx) nào trong thư mục."))
-            temp_widget = QWidget()
-            temp_widget.setLayout(temp_layout)
-            self.layout.addWidget(temp_widget, 0, 0)
+            self.layout.addWidget(QLabel("Không có file mẫu (.doc, .docx) nào trong thư mục."))
             return
 
-        # THAY ĐỔI: Đặt Card vào QGridLayout (4 cột)
-        col_count = 4 
-        for i, filename in enumerate(template_files):
+        for filename in template_files:
             file_path = os.path.join(CONTRACT_TEMPLATE_PATH, filename)
-            row = i // col_count
-            col = i % col_count
-            self.layout.addWidget(self._create_template_item(filename, file_path), row, col)
+            self.layout.addWidget(self._create_template_item(filename, file_path))
             
     def add_new_template(self):
         target_path = CONTRACT_TEMPLATE_PATH
@@ -766,63 +746,57 @@ class ContractTemplateWidget(QWidget):
 
         original_file_name = os.path.basename(file_path)
         
-        # 2. CHỌN TÊN FILE LƯU
-        save_file_name, _ = QFileDialog.getSaveFileName(
-            self,
-            "Lưu Hợp đồng đã Dịch",
-            os.path.join(CONTRACT_TEMPLATE_PATH, f"Translated_{os.path.splitext(original_file_name)[0]}.docx"), # Tên mặc định
-            "Tài liệu Word (*.docx)"
-        )
+        # 2. TẠO ĐƯỜNG DẪN LƯU TỰ ĐỘNG TRONG THƯ MỤC TEMPLATE
+        save_file_name = f"Translated_{original_file_name}"
+        save_path = os.path.join(CONTRACT_TEMPLATE_PATH, save_file_name)
         
-        if not save_file_name:
-            return
-
-        save_path = save_file_name
-        
-        # 3. TẠO HIỆU ỨNG LOADING (ProgressDialog)
-        progress = QProgressDialog("Đang dịch file Word...", "Hủy", 0, 0, self)
-        progress.setWindowTitle("Đang Xử lý")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setCancelButton(None) 
-        progress.show()
-        QCoreApplication.processEvents() # Cập nhật UI
+        # 3. XỬ LÝ GHI ĐÈ
+        if os.path.exists(save_path):
+            # SỬ DỤNG QMessageBox TÙY CHỈNH (Giống xác nhận xóa)
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Xác nhận Ghi đè")
+            msg_box.setText(f"File '{save_file_name}' (đã dịch) đã tồn tại trong thư mục mẫu.\nBạn có muốn ghi đè?")
+            
+            btn_yes = msg_box.addButton("Có", QMessageBox.YesRole)
+            btn_no = msg_box.addButton("Không", QMessageBox.NoRole)
+            msg_box.setDefaultButton(btn_no) 
+            
+            msg_box.exec()
+            
+            if msg_box.clickedButton() == btn_no:
+                return
 
         try:
             doc_original = Document(file_path)
             doc_new = Document()
             
-            translated_count = 0
-            
             # --- Xử lý Dịch từng Paragraph ---
+            translated_count = 0
             for paragraph in doc_original.paragraphs:
                 text_original = paragraph.text.strip()
                 
-                # Copy đoạn gốc
+                # Copy định dạng từ đoạn gốc sang đoạn mới
                 new_para_original = doc_new.add_paragraph(text_original)
-                new_para_original.style = paragraph.style
-                if paragraph.alignment:
-                    new_para_original.alignment = paragraph.alignment
+                if paragraph.runs:
+                    # Cố gắng copy định dạng cơ bản của run đầu tiên
+                    first_run = paragraph.runs[0]
+                    new_para_original.runs[0].bold = first_run.bold
+                    new_para_original.runs[0].italic = first_run.italic
+                    new_para_original.runs[0].font.name = first_run.font.name
+                    new_para_original.style = paragraph.style
                 
                 if text_original:
-                    # Tiêu chí: Dài hơn 5 ký tự và không chỉ chứa số, khoảng trắng, ký tự đặc biệt
                     if len(text_original) > 5 and not re.match(r'^[\d\s\W]*$', text_original): 
                         translation = self.translator.translate(text_original, src='vi', dest='en')
                         text_translated = translation.text
                         translated_count += 1
                         
-                        # Chèn bản dịch ngay bên dưới (In đậm, Nghiêng, MÀU XÁM NHẠT)
+                        # Chèn bản dịch ngay bên dưới (In đậm và Nghiêng)
                         new_para_translated = doc_new.add_paragraph()
-                        new_para_translated.style = paragraph.style # Giữ style gốc
-                        if paragraph.alignment:
-                            new_para_translated.alignment = paragraph.alignment
-
-                        run_translated = new_para_translated.add_run(text_translated) # LOẠI BỎ [..]
+                        run_translated = new_para_translated.add_run(f"[{text_translated}]")
                         run_translated.bold = True
                         run_translated.italic = True
-                        
-                        # Đặt màu chữ XÁM NHẠT (ví dụ: RGB(128, 128, 128))
-                        if RGBColor:
-                            run_translated.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+                        new_para_translated.style = paragraph.style 
                     
             
             # --- Xử lý Dịch Table ---
@@ -837,23 +811,7 @@ class ContractTemplateWidget(QWidget):
                         
                         if text_cell and len(text_cell) > 5 and not re.match(r'^[\d\s\W]*$', text_cell):
                             translation = self.translator.translate(text_cell, src='vi', dest='en')
-                            
-                            # Gộp văn bản gốc và bản dịch (bản dịch in đậm/nghiêng)
-                            cell_text_new = Document()
-                            
-                            # Thêm đoạn gốc
-                            p_orig = cell_text_new.add_paragraph()
-                            p_orig.add_run(text_cell)
-                            
-                            # Thêm đoạn dịch (In đậm, Nghiêng, MÀU XÁM NHẠT)
-                            p_trans = cell_text_new.add_paragraph()
-                            run_trans = p_trans.add_run(translation.text)
-                            run_trans.bold = True
-                            run_trans.italic = True
-                            if RGBColor:
-                                run_trans.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
-                                
-                            text_translated = "\n".join([p.text for p in cell_text_new.paragraphs])
+                            text_translated = f"{text_cell}\n[{translation.text}]"
                             translated_count += 1
                         else:
                             text_translated = text_cell
@@ -864,19 +822,17 @@ class ContractTemplateWidget(QWidget):
                     for idx, data in enumerate(cells_data):
                          row_new.cells[idx].text = data
                          
-            # 4. LƯU FILE VÀO THƯ MỤC TEMPLATE (hoặc nơi đã chọn)
+            # 4. LƯU FILE VÀO THƯ MỤC TEMPLATE
             doc_new.save(save_path)
             
             # 5. TẢI LẠI GIAO DIỆN ĐỂ HIỂN THỊ CARD MỚI
             self.load_templates()
             
-            progress.close()
             QMessageBox.information(self, "Thành công", 
                                     f"Đã tạo file hợp đồng dịch: {os.path.basename(save_path)}\n"
                                     f"Tổng số đoạn/ô được dịch: {translated_count}")
             
         except Exception as e:
-            progress.close()
             QMessageBox.critical(self, "Lỗi Dịch File", f"Không thể tạo file dịch:\n{e}\n"
                                                       "Vui lòng kiểm tra kết nối mạng và thư viện googletrans.")
     
@@ -897,9 +853,7 @@ class ContractTemplateWidget(QWidget):
                 super().__init__(parent)
                 self.file_path = path
                 self.setCursor(Qt.PointingHandCursor)
-                # THAY ĐỔI: Dùng setMinimumWidth và bỏ setFixedSize
-                self.setMinimumWidth(260) 
-                self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed) # Dùng Preferred cho width
+                self.setFixedSize(260, 180) 
                 self.default_style = self._get_default_style()
                 self.hover_style = self._get_hover_style()
                 self.setStyleSheet(self.default_style)
@@ -911,7 +865,8 @@ class ContractTemplateWidget(QWidget):
                         border-radius: 12px; 
                         background-color: white; /* THAY ĐỔI: Màu nền thẻ là trắng */
                         box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); 
-                        margin: 5px; /* Giảm margin để phù hợp với Grid */
+                        margin-top: 5px; 
+                        margin-bottom: 5px;
                     }
                 """
             
@@ -921,13 +876,11 @@ class ContractTemplateWidget(QWidget):
                         border: 1px solid #ddd; 
                         border-radius: 12px; 
                         background-color: #e6f0ff; /* THAY ĐỔI: Màu hover */
-                        box-shadow: 0 5px 10px rgba(0, 0, 0, 0.15); /* Giảm shadow */
-                        margin: 5px; 
+                        box-shadow: 0 10px 20px rgba(0, 0, 0, 0.2);
+                        margin-top: 1px;
+                        margin-bottom: 9px; 
                     }
                 """
-            
-            def sizeHint(self):
-                return QSize(260, 180) # Cố định chiều cao
 
             def enterEvent(self, event):
                 self.setStyleSheet(self.hover_style)
@@ -1077,8 +1030,8 @@ class MainWindow(QMainWindow):
         self.search_results_list = QListWidget()
         self.search_results_list.setFocusPolicy(Qt.NoFocus) 
         self.search_results_list.setStyleSheet("QListWidget { border: 1px solid #ccc; background-color: white; }")
-        # THAY ĐỔI (QUAN TRỌNG): Cố định chiều cao 200px
-        self.search_results_list.setFixedHeight(200) 
+        # THAY ĐỔI (QUAN TRỌNG): Cố định chiều cao 160px
+        self.search_results_list.setFixedHeight(160) 
         self.search_results_list.hide() # Ẩn mặc định
         
         self.search_results_list.itemClicked.connect(self._select_file_from_search)
@@ -1102,7 +1055,7 @@ class MainWindow(QMainWindow):
         file_actions_layout.addWidget(self.btn_delete_file)
         
         # THÊM: NÚT THAY ĐỔI ROOT FILE
-        self.btn_change_root = QPushButton("Thay đổi Folder gốc")
+        self.btn_change_root = QPushButton("Thay đổi ROOT FILE")
         self.btn_change_root.setIcon(style.standardIcon(QStyle.SP_DirHomeIcon))
         self.btn_change_root.setToolTip("Thay đổi thư mục gốc của cây thư mục.")
         self.btn_change_root.clicked.connect(self.change_root_folder)
@@ -1516,6 +1469,15 @@ class MainWindow(QMainWindow):
                     doc = Document(file_path)
                     text = "\n\n".join(p.text for p in doc.paragraphs)
                     self.preview.show_text(text)
+            # [CẬP NHẬT] Xử lý file .doc (Word cũ)
+            elif ext == ".doc": 
+                self.preview.show_text(
+                    "Định dạng Word cũ (.doc) không được hỗ trợ đọc nội dung trực tiếp "
+                    "bởi thư viện Python-docx.\n\n"
+                    "Vui lòng:\n"
+                    "1. **Chuyển đổi file sang định dạng Word mới (.docx)** để xem trước nội dung.\n"
+                    "2. Hoặc nhấn nút **'Mở File'** để xem bằng ứng dụng Microsoft Word mặc định."
+                )
             elif ext in (".xlsx", ".xls"):
                 try:
                     wb = openpyxl.load_workbook(file_path, data_only=True)
@@ -1550,9 +1512,9 @@ def main():
     if fitz is None:
         print("CẢNH BÁO: Thư viện 'PyMuPDF' (fitz) chưa được cài đặt. Không thể xem trước file PDF.")
     if Document is None:
-        print("CẢNH BẢO: Thư viện 'python-docx' chưa được cài đặt. Không thể xem trước file DOCX/dịch hợp đồng.")
+        print("CẢNH BẢO: Thư viện 'python-docx' chưa được cài đặt. Không thể xem trước file DOCX.")
     if Translator is None:
-        print("CẢNH BẢNG: Thư viện 'googletrans' chưa được cài đặt. Không thể dịch hợp đồng. Cài đặt: pip install googletrans==4.0.0-rc1")
+        print("CẢNH BẢO: Thư viện 'googletrans' chưa được cài đặt. Không thể dịch hợp đồng. Cài đặt: pip install googletrans==4.0.0-rc1")
     
     app = QApplication(sys.argv)
     w = MainWindow()
