@@ -1,0 +1,6 @@
+# Bỏ qua tệp main.py
+main.py
+
+# Bạn cũng có thể thêm các tệp khác
+# *.log
+# /dist/
