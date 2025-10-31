@@ -5,9 +5,11 @@ import re
 import threading
 import subprocess
 import tempfile
+import os.path
 from datetime import datetime
+from typing import List, Dict, Any # THÊM import typing
 
-from PySide6.QtCore import Qt, QDir, QSize, Signal, QObject
+from PySide6.QtCore import Qt, QDir, QSize, Signal, QObject, QThread, QModelIndex # THÊM QThread, QObject, Signal
 from PySide6.QtGui import QPixmap, QImage, QIcon
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTreeView,
@@ -49,492 +51,582 @@ class PdfWorker(QObject):
         super().__init__()
         self.pdf_bytes = pdf_bytes
         self.scale = scale
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
 
     def run(self):
         if fitz is None:
-            self.error.emit("PyMuPDF (fitz) not installed")
-            return
-        try:
-            doc = fitz.open(stream=self.pdf_bytes, filetype="pdf")
-            for i in range(doc.page_count):
-                page = doc.load_page(i)
-                mat = fitz.Matrix(self.scale, self.scale)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888)
-                # Emit a copy to be safe
-                self.page_rendered.emit(img.copy())
+            self.error.emit("PyMuPDF (fitz) chưa được cài đặt. Không thể xem trước PDF.")
             self.finished.emit()
+            return
+            
+        try:
+            # Sử dụng PyMuPDF để xử lý PDF từ bytes
+            doc = fitz.open(stream=self.pdf_bytes, filetype="pdf")
+            
+            for i in range(doc.page_count):
+                if self._is_cancelled:
+                    break
+
+                page = doc.load_page(i)
+                # Render page to Pixmap/Image
+                pix = page.get_pixmap(matrix=fitz.Matrix(self.scale, self.scale))
+                
+                # Chuyển đổi Pixmap sang QImage
+                img_format = QImage.Format.Format_RGB32 if pix.alpha else QImage.Format.Format_RGB888
+                img = QImage(pix.samples, pix.width, pix.height, pix.stride, img_format)
+                
+                self.page_rendered.emit(img)
+                QApplication.processEvents() # Cho phép UI cập nhật
+
+            doc.close()
         except Exception as e:
-            self.error.emit(str(e))
+            self.error.emit(f"Lỗi khi đọc file PDF: {e}")
+        finally:
+            self.finished.emit()
+
+# --- NEW: Loading Overlay ---
+class LoadingOverlay(QWidget):
+    """Một lớp overlay đơn giản hiển thị thông báo 'Loading'."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Không dùng FramelessWindowHint vì nó là child của FileManagerWidget
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Container cho thông báo loading
+        loading_container = QWidget()
+        loading_container.setStyleSheet("background-color: rgba(0, 0, 0, 150); border-radius: 10px;")
+        
+        container_layout = QVBoxLayout(loading_container)
+        
+        self.label = QLabel("Đang tải dữ liệu, vui lòng chờ...")
+        self.label.setStyleSheet("color: white; font-size: 16pt; padding: 20px;")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0) # Chế độ busy/indeterminate
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { 
+                border: 1px solid white; 
+                border-radius: 5px; 
+                text-align: center; 
+                height: 10px;
+                margin: 0 50px;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+            }
+        """)
+        
+        container_layout.addWidget(self.label, alignment=Qt.AlignmentFlag.AlignCenter)
+        container_layout.addWidget(self.progress_bar)
+        
+        main_layout.addWidget(loading_container, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+    def show_overlay(self):
+        # Thiết lập kích thước bằng với widget cha
+        if self.parentWidget():
+            self.setGeometry(self.parentWidget().rect())
+        self.raise_()
+        self.show()
+
+    def hide_overlay(self):
+        self.hide()
+        
+    def resizeEvent(self, event):
+        # Đảm bảo overlay luôn che phủ toàn bộ widget cha khi cha thay đổi kích thước
+        if self.parentWidget():
+            self.setGeometry(self.parentWidget().rect())
+        super().resizeEvent(event)
 
 
-# --- DOCX rendering worker (emits PDF bytes) ---
-class DocxToPdfWorker(QObject):
-    pdf_ready = Signal(bytes)
+# --- NEW: File Scan Worker (Luồng chạy nền để quét file) ---
+class FileScanWorker(QObject):
+    """Quét thư mục gốc và lưu trữ thông tin file vào cache."""
+    finished = Signal(list) # Gửi list thông tin file đã cache
     error = Signal(str)
 
-    def __init__(self, docx_path: str, converter_func):
+    def __init__(self, root_path: str):
         super().__init__()
-        self.docx_path = docx_path
-        self.converter_func = converter_func 
+        self.root_path = root_path
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
 
     def run(self):
+        file_cache: List[Dict[str, Any]] = []
         try:
-            pdf_bytes = self.converter_func(self.docx_path)
-            if pdf_bytes:
-                self.pdf_ready.emit(pdf_bytes)
-            else:
-                self.error.emit("Không tìm thấy công cụ chuyển đổi (MS Word/LibreOffice).")
+            # os.walk là blocking, nhưng nó chạy trong QThread nên không block UI
+            for root, _, files in os.walk(self.root_path):
+                if self._is_cancelled:
+                    return
+
+                for file_name in files:
+                    if self._is_cancelled:
+                        return
+                    
+                    full_path = os.path.join(root, file_name)
+                    
+                    # Chỉ lưu trữ các thông tin cần thiết để tìm kiếm và hiển thị
+                    file_info = {
+                        'name': file_name,
+                        'path': full_path,
+                        'lower_name': file_name.lower(),
+                        'dir': root # Thư mục chứa file
+                    }
+                    file_cache.append(file_info)
+
+            self.finished.emit(file_cache)
         except Exception as e:
-            self.error.emit(f"Lỗi chuyển đổi DOCX: {str(e)}")
-
-
-# ------------------------ Custom File System Model ------------------------
+            self.error.emit(f"Lỗi quét thư mục: {str(e)}")
+            
+            
+# --- Custom Model & Preview Widgets (Giữ nguyên) ---
 class CustomFileSystemModel(QFileSystemModel):
-    """Ẩn file tạm thời bắt đầu bằng '~$'."""
-    def filterAcceptsRow(self, source_row, source_parent):
-        index = self.index(source_row, 0, source_parent)
-        file_name = self.fileName(index)
+    # Giữ nguyên CustomFileSystemModel
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(False)
 
-        # Ẩn file bắt đầu bằng "~$" (temporary/lock files)
-        if file_name.startswith("~$"):
-            return False
-
-        return super().filterAcceptsRow(source_row, source_parent)
-
-
-# ------------------------ Preview Widget ------------------------
 class PreviewWidget(QWidget):
-    """Hiển thị nội dung file: text, ảnh, pdf (từ bytes)."""
+    # Giữ nguyên PreviewWidget
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.text_preview = QTextEdit()
+        self.text_preview.setReadOnly(True)
+        self.image_preview = QLabel()
+        self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.image_preview.setScaledContents(True)
 
-    def __init__(self):
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setWidget(self.image_preview)
+
+        self.layout.addWidget(self.text_preview)
+        self.layout.addWidget(self.scroll_area)
+
+        self.show_text("Chọn file để xem trước...")
+        
+        self.pdf_thread = None
+        self.pdf_worker = None
+        
+    # Thêm hàm show_text, show_image, clear_preview (Giữ nguyên)
+    def show_text(self, text):
+        self.text_preview.setText(text)
+        self.text_preview.show()
+        self.scroll_area.hide()
+
+    def show_image(self, image: QImage):
+        # Dừng worker PDF cũ nếu có
+        self.cancel_pdf_worker()
+        
+        # Chỉ hiển thị hình ảnh đầu tiên hoặc một hình ảnh duy nhất
+        self.image_preview.setPixmap(QPixmap.fromImage(image))
+        self.text_preview.hide()
+        self.scroll_area.show()
+
+    def show_multi_page_images(self, pdf_bytes, mime_type):
+        """Xử lý xem trước PDF/DOCX (cần chuyển sang PDF) bằng luồng riêng."""
+        self.cancel_pdf_worker()
+        self.clear_preview()
+        self.show_text("Đang tải xem trước...")
+        
+        # Sử dụng tạm file để chuyển DOCX sang PDF nếu cần
+        temp_pdf_path = None
+        
+        if mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' and docx2pdf is not None:
+             try:
+                 temp_pdf_path = os.path.join(tempfile.gettempdir(), f"preview_{os.getpid()}_{datetime.now().microsecond}.pdf")
+                 # Ghi docx bytes ra file tạm để docx2pdf có thể đọc
+                 with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp_docx:
+                    tmp_docx.write(pdf_bytes)
+                    temp_docx_path = tmp_docx.name
+                 
+                 docx2pdf.convert(temp_docx_path, temp_pdf_path)
+                 
+                 # Đọc lại PDF bytes
+                 with open(temp_pdf_path, 'rb') as f:
+                     pdf_bytes = f.read()
+                 
+             except Exception as e:
+                 self.show_text(f"Lỗi chuyển đổi DOCX sang PDF: {e}")
+                 # Dọn dẹp file tạm
+                 if os.path.exists(temp_pdf_path): os.remove(temp_pdf_path)
+                 if os.path.exists(temp_docx_path): os.remove(temp_docx_path)
+                 return
+             finally:
+                 # Dọn dẹp file tạm docx
+                 if os.path.exists(temp_docx_path): os.remove(temp_docx_path)
+
+
+        self.pdf_thread = QThread()
+        # Scale 1.5 cho hình ảnh sắc nét hơn
+        self.pdf_worker = PdfWorker(pdf_bytes, scale=1.5)
+        self.pdf_worker.moveToThread(self.pdf_thread)
+
+        self.pdf_thread.started.connect(self.pdf_worker.run)
+        self.pdf_worker.page_rendered.connect(self._add_page_to_preview)
+        self.pdf_worker.finished.connect(self._handle_pdf_finished)
+        self.pdf_worker.error.connect(self._handle_pdf_error)
+        
+        self.pdf_thread.start()
+
+    def _add_page_to_preview(self, image: QImage):
+        """Thêm hình ảnh trang vào layout của image_preview."""
+        # Chuyển layout của image_preview sang QVBoxLayout để xếp chồng các trang
+        if not isinstance(self.image_preview.parentWidget().layout(), QVBoxLayout):
+            container = QWidget()
+            old_layout = self.image_preview.parentWidget().layout()
+            if old_layout:
+                old_layout.removeWidget(self.image_preview.parentWidget())
+            
+            new_layout = QVBoxLayout(container)
+            new_layout.setSpacing(10) # Khoảng cách giữa các trang
+            new_layout.setContentsMargins(0, 0, 0, 0)
+            new_layout.addWidget(self.image_preview)
+            self.image_preview.setParent(container)
+            self.scroll_area.setWidget(container)
+            self.image_preview.hide() # Ẩn label cũ
+            
+        # Tạo QLabel mới cho trang hiện tại
+        lbl = QLabel()
+        lbl.setPixmap(QPixmap.fromImage(image))
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setMinimumWidth(image.width()) 
+        
+        # Thêm QLabel mới vào layout của container
+        self.scroll_area.widget().layout().addWidget(lbl)
+        
+        self.text_preview.hide()
+        self.scroll_area.show()
+
+    def _handle_pdf_finished(self):
+        # Dọn dẹp sau khi render xong
+        self.pdf_thread.quit()
+        self.pdf_thread.wait()
+        
+    def _handle_pdf_error(self, message: str):
+        self.show_text(f"Lỗi xem trước đa trang: {message}")
+        self.pdf_thread.quit()
+        self.pdf_thread.wait()
+
+    def cancel_pdf_worker(self):
+        if self.pdf_worker and self.pdf_thread and self.pdf_thread.isRunning():
+            self.pdf_worker.cancel()
+            self.pdf_thread.quit()
+            self.pdf_thread.wait()
+
+    def clear_preview(self):
+        # Dọn dẹp hình ảnh cũ
+        self.cancel_pdf_worker()
+        self.image_preview.clear()
+        
+        # Nếu đang ở chế độ nhiều trang, dọn dẹp các QLabel con
+        if isinstance(self.scroll_area.widget().layout(), QVBoxLayout):
+            layout = self.scroll_area.widget().layout()
+            # Xóa tất cả widget con (các trang PDF)
+            while layout.count() > 0:
+                item = layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            # Đặt lại widget cho scroll area nếu cần (chỉ để tránh lỗi)
+            self.image_preview = QLabel()
+            self.image_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.image_preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+            self.image_preview.setScaledContents(True)
+            self.scroll_area.setWidget(self.image_preview)
+
+        self.show_text("Chọn file để xem trước...")
+
+class DocxWorker(QObject):
+    # Giữ nguyên DocxWorker
+    finished = Signal(str)
+    error = Signal(str)
+    
+    def __init__(self, file_path):
         super().__init__()
-        self.setStyleSheet("QWidget { background-color: white; }")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        self.file_path = file_path
 
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-
-        self.text = QTextEdit(readOnly=True)
-
-        self.img_label = QLabel(alignment=Qt.AlignCenter)
-        self.img_scroll = QScrollArea()
-        self.img_scroll.setWidgetResizable(True)
-        self.img_scroll.setWidget(self.img_label)
-        self.img_scroll.setStyleSheet("QScrollArea { border: 1px solid #ddd; }")
-
-        self.pdf_scroll = QScrollArea()
-        self.pdf_scroll.setWidgetResizable(True)
-        self.pdf_container = QWidget()
-        self.pdf_vlayout = QVBoxLayout(self.pdf_container)
-        self.pdf_vlayout.setAlignment(Qt.AlignTop)
-        self.pdf_scroll.setWidget(self.pdf_container)
-        self.pdf_scroll.setStyleSheet("QScrollArea { border: 1px solid #ddd; }")
-
-        layout.addWidget(self.text)
-        layout.addWidget(self.img_scroll)
-        layout.addWidget(self.pdf_scroll)
-
-        # start hidden
-        self.text.hide()
-        self.img_scroll.hide()
-        self.pdf_scroll.hide()
-
-        self._pdf_worker_thread = None
-        self._pdf_worker_obj = None
-
-    def clear_pdf_pages(self):
-        while self.pdf_vlayout.count():
-            it = self.pdf_vlayout.takeAt(0)
-            w = it.widget()
-            if w:
-                w.deleteLater()
-
-    def show_text(self, s: str):
-        self._stop_pdf()
-        self.clear_pdf_pages()
-        self.img_scroll.hide()
-        self.pdf_scroll.hide()
-        self.text.show()
-        self.text.setPlainText(s)
-
-    def show_image(self, path: str):
-        self._stop_pdf()
-        self.clear_pdf_pages()
-        self.text.hide()
-        self.pdf_scroll.hide()
-        self.img_scroll.show()
-        pix = QPixmap(path)
-        if pix.isNull():
-            self.show_text("Không thể hiển thị ảnh.")
+    def run(self):
+        if Document is None:
+            self.error.emit("Thư viện 'python-docx' chưa được cài đặt.")
             return
-        max_w = 900
-        if pix.width() > max_w:
-            pix = pix.scaledToWidth(max_w, Qt.SmoothTransformation)
-        self.img_label.setPixmap(pix)
 
-    def show_pdf_bytes(self, pdf_bytes: bytes):
-        """
-        Render PDF (bytes) into images and show them.
-        Uses PdfWorker which emits QImage pages.
-        """
-        self._stop_pdf()
-        self.clear_pdf_pages()
-        self.text.hide()
-        self.img_scroll.hide()
-        self.pdf_scroll.show()
-        loading = QLabel("Đang tải PDF...")
-        loading.setAlignment(Qt.AlignCenter)
-        self.pdf_vlayout.addWidget(loading)
+        try:
+            document = Document(self.file_path)
+            full_text = []
+            for para in document.paragraphs:
+                full_text.append(para.text)
+            self.finished.emit('\n'.join(full_text))
+        except Exception as e:
+            self.error.emit(f"Lỗi đọc file DOCX: {e}")
 
-        worker = PdfWorker(pdf_bytes, scale=1.0)
-        thread = threading.Thread(target=worker.run, daemon=True)
+class ExcelWorker(QObject):
+    # Giữ nguyên ExcelWorker
+    finished = Signal(str)
+    error = Signal(str)
 
-        def on_page(img: QImage):
-            # remove loading label on first page rendered
-            nonlocal loading
-            if loading and loading.parent():
-                loading.deleteLater()
-                loading = None
-            lbl = QLabel()
-            lbl.setPixmap(QPixmap.fromImage(img))
-            lbl.setAlignment(Qt.AlignCenter)
-            self.pdf_vlayout.addWidget(lbl)
-            QApplication.processEvents()
-
-        def on_error(msg):
-            self.show_text("Lỗi hiển thị PDF: " + msg)
-
-        # connect signals (worker is QObject)
-        worker.page_rendered.connect(on_page)
-        worker.error.connect(on_error)
-
-        self._pdf_worker_obj = worker
-        self._pdf_worker_thread = thread
-        thread.start()
-
-    def _stop_pdf(self):
-        # stop any previous rendering (we don't have cancel logic for the pure-thread worker,
-        # but we clear UI and drop references)
-        self.clear_pdf_pages()
-        self._pdf_worker_obj = None
-        self._pdf_worker_thread = None
-
-
-# ------------------------ File Manager Widget ------------------------
-class FileManagerWidget(QWidget):
-    """Màn hình quản lý file"""
-
-    def __init__(self, root_folder=r"D:\Client"):
+    def __init__(self, file_path):
         super().__init__()
-        self.root_folder = root_folder if os.path.exists(root_folder) else QDir.rootPath()
-        self.current_file = None
+        self.file_path = file_path
 
-        # Thêm biến theo dõi worker DOCX
-        self._docx_worker_thread = None
-        self._docx_worker_obj = None
+    def run(self):
+        if openpyxl is None:
+            self.error.emit("Thư viện 'openpyxl' chưa được cài đặt.")
+            return
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        self.setStyleSheet("QWidget { background-color: #f7f9fc; }")
+        try:
+            workbook = openpyxl.load_workbook(self.file_path, read_only=True)
+            output = ["--- Xem trước Excel ---"]
+            # Chỉ xem trước sheet đầu tiên
+            sheet = workbook.active
+            
+            for row in sheet.iter_rows(max_row=10, max_col=5): # Chỉ lấy 10 hàng đầu tiên, 5 cột đầu tiên
+                row_data = [str(cell.value) if cell.value is not None else "" for cell in row]
+                output.append('\t'.join(row_data))
+                
+            workbook.close()
+            self.finished.emit('\n'.join(output))
+        except Exception as e:
+            self.error.emit(f"Lỗi đọc file Excel: {e}")
 
-        style = QApplication.style()
 
-        # --- Thanh tìm kiếm ---
-        search_layout = QHBoxLayout()
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Tìm kiếm gần đúng tên file...")
-        self.search_input.addAction(style.standardIcon(QStyle.SP_FileDialogContentsView), QLineEdit.LeadingPosition)
-        self.search_input.textChanged.connect(self.on_search)
-        search_layout.addWidget(self.search_input)
-        layout.addLayout(search_layout)
+# --- FileManagerWidget (ĐÃ CẬP NHẬT) ---
+class FileManagerWidget(QWidget):
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        
+        # --- File Manager Panel ---
+        self.file_panel = QWidget()
+        file_panel_layout = QVBoxLayout(self.file_panel)
+        file_panel_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.search_results_list = QListWidget()
-        self.search_results_list.setFixedHeight(160)
-        self.search_results_list.hide()
-        self.search_results_list.itemClicked.connect(self.select_from_search)
-        layout.addWidget(self.search_results_list)
-
-        # --- Nút thao tác file ---
-        btn_row = QHBoxLayout()
-        self.btn_add = QPushButton("Thêm File")
-        self.btn_add.setIcon(style.standardIcon(QStyle.SP_FileIcon))
-        self.btn_add.clicked.connect(self.add_file)
-
-        self.btn_delete = QPushButton("Xóa File/Folder")
-        self.btn_delete.setIcon(style.standardIcon(QStyle.SP_TrashIcon))
-        self.btn_delete.clicked.connect(self.delete_file)
-
-        self.btn_root = QPushButton("Đổi Folder Gốc")
-        self.btn_root.setIcon(style.standardIcon(QStyle.SP_DirHomeIcon))
+        # 1. Control Bar
+        control_bar = QHBoxLayout()
+        self.btn_root = QPushButton("Thư mục Gốc")
+        self.btn_root.setIcon(QApplication.style().standardIcon(QStyle.SP_DialogOpenButton))
         self.btn_root.clicked.connect(self.change_root)
-
-        self.btn_refresh = QPushButton()
-        self.btn_refresh.setIcon(style.standardIcon(QStyle.SP_BrowserReload))
-        self.btn_refresh.setFixedWidth(35)
+        control_bar.addWidget(self.btn_root)
+        
+        self.btn_refresh = QPushButton("Làm mới")
+        self.btn_refresh.setIcon(QApplication.style().standardIcon(QStyle.SP_BrowserReload))
         self.btn_refresh.clicked.connect(self.refresh_tree)
+        control_bar.addWidget(self.btn_refresh)
+        
+        self.btn_add_file = QPushButton("Thêm File")
+        self.btn_add_file.setIcon(QApplication.style().standardIcon(QStyle.SP_FileIcon))
+        self.btn_add_file.clicked.connect(self.add_file)
+        control_bar.addWidget(self.btn_add_file)
 
-        btn_row.addWidget(self.btn_add)
-        btn_row.addWidget(self.btn_delete)
-        btn_row.addWidget(self.btn_root)
-        btn_row.addStretch()
-        btn_row.addWidget(self.btn_refresh)
-        layout.addLayout(btn_row)
-
-        # --- Cây thư mục & khu vực xem trước ---
-        splitter = QSplitter(Qt.Horizontal)
-        layout.addWidget(splitter)
-
-        self.model = CustomFileSystemModel()
-        self.model.setRootPath(self.root_folder)
-        self.model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot)
-
+        self.btn_delete = QPushButton("Xóa")
+        self.btn_delete.setIcon(QApplication.style().standardIcon(QStyle.SP_TrashIcon))
+        self.btn_delete.clicked.connect(self.delete_file)
+        control_bar.addWidget(self.btn_delete)
+        
+        file_panel_layout.addLayout(control_bar)
+        
+        # 2. Search Box
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Tìm kiếm file (trong cache)...")
+        file_panel_layout.addWidget(self.search_box)
+        
+        # 3. Tree View (Hiển thị Cây thư mục)
         self.tree = QTreeView()
+        self.tree.setHeaderHidden(True)
+        self.tree.setSelectionMode(QTreeView.SelectionMode.SingleSelection)
+        file_panel_layout.addWidget(self.tree)
+        
+        # 4. Search Results List (Hiển thị kết quả tìm kiếm từ Cache)
+        self.search_results_list = QListWidget()
+        self.search_results_list.setToolTip("Kết quả tìm kiếm từ bộ nhớ cache")
+        self.search_results_list.setVisible(False) # Ẩn mặc định
+        file_panel_layout.addWidget(self.search_results_list)
+
+        # Kết nối tín hiệu
+        self.tree.doubleClicked.connect(self.open_file_with_preview)
+        self.search_results_list.itemDoubleClicked.connect(self.open_file_from_list)
+        self.search_box.textChanged.connect(self._toggle_tree_list) # Chuyển đổi hiển thị
+        self.search_box.textChanged.connect(self._perform_cache_search) # Kích hoạt tìm kiếm
+
+        # --- Model Setup ---
+        self.root_folder = os.path.abspath(QDir.rootPath()) # Mặc định là thư mục gốc
+        self.current_file = None
+        
+        self.model = CustomFileSystemModel()
+        # VÔ HIỆU HÓA LỌC MẶC ĐỊNH TRÊN MODEL:
+        # self.model.setFilter(QDir.NoDotAndDotDot | QDir.AllEntries)
+        # self.model.setRootPath(self.root_folder)
+        
+        # Vẫn dùng model để hiển thị cây thư mục cơ bản (vẫn nhanh), nhưng search sẽ dùng cache
+        self.model.setRootPath(self.root_folder)
         self.tree.setModel(self.model)
         self.tree.setRootIndex(self.model.index(self.root_folder))
-        self.tree.hideColumn(1)
-        self.tree.hideColumn(2)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tree.clicked.connect(self.on_tree_clicked)
-        splitter.addWidget(self.tree)
 
-        # --- Preview ---
-        preview_box = QWidget()
-        preview_layout = QVBoxLayout(preview_box)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
+        # Ẩn các cột không cần thiết
+        for i in range(1, self.model.columnCount()):
+            self.tree.hideColumn(i)
+        
+        # --- NEW: Thuộc tính Cache và Worker ---
+        self.file_cache: List[Dict[str, Any]] = []
+        self.scan_worker: FileScanWorker | None = None
+        self.scan_thread: QThread | None = None
+        
+        # --- NEW: Thêm Loading Overlay ---
+        self.loading_overlay = LoadingOverlay(self)
+        self.loading_overlay.hide() # Ẩn mặc định
 
-        header = QHBoxLayout()
-        self.lbl_filename = QLabel("Chọn một tệp để xem trước")
-        header.addWidget(self.lbl_filename)
-        header.addStretch()
-        self.btn_open = QPushButton("Mở File")
-        self.btn_open.setIcon(style.standardIcon(QStyle.SP_DialogOpenButton))
-        self.btn_open.setEnabled(False)
-        self.btn_open.clicked.connect(self.open_file)
-        header.addWidget(self.btn_open)
-        preview_layout.addLayout(header)
+        # Ẩn/Hiện List/Tree ban đầu
+        self._toggle_tree_list("")
 
-        self.preview = PreviewWidget()
-        preview_layout.addWidget(self.preview)
+        # Bắt đầu tải dữ liệu ban đầu
+        self.load_root_folder(self.root_folder) 
 
-        self.lbl_file_info = QLabel("Ngày: N/A")
-        self.lbl_file_info.setStyleSheet("color: gray; font-size: 9pt; padding: 4px; border-top: 1px solid #ccc;")
-        self.lbl_file_info.setAlignment(Qt.AlignRight)
-        self.lbl_file_info.hide()
-        preview_layout.addWidget(self.lbl_file_info)
-        splitter.addWidget(preview_box)
+        # --- Preview Panel ---
+        self.preview_panel = PreviewWidget()
+        
+        # --- Splitter (chia đôi) ---
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self.file_panel)
+        splitter.addWidget(self.preview_panel)
+        splitter.setSizes([300, 700]) # Kích thước ban đầu
 
-        splitter.setSizes([400, 800])
-
-    # ------------------------ Helpers: docx -> pdf bytes ------------------------
-    def _convert_docx_to_pdf_bytes(self, docx_path: str) -> bytes | None:
-        """
-        Try multiple strategies to convert a .docx to PDF bytes:
-        1. docx2pdf (Windows + MS Word installed)
-        2. LibreOffice / soffice command-line conversion (cross-platform if installed)
-        Returns PDF bytes on success, or None on failure.
-        """
-        # 1) Try docx2pdf (Windows / MS Word)
-        try:
-            if docx2pdf and sys.platform.startswith("win"):
-                tmp_out = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-                tmp_out.close()
-                try:
-                    # docx2pdf.convert accepts input, output paths
-                    docx2pdf.convert(docx_path, tmp_out.name)
-                    with open(tmp_out.name, "rb") as f:
-                        data = f.read()
-                    return data
-                finally:
-                    try:
-                        os.unlink(tmp_out.name)
-                    except Exception:
-                        pass
-        except Exception:
-            # ignore and fallback
-            pass
-
-        # 2) Try LibreOffice / soffice
-        try:
-            # create temp dir for output
-            with tempfile.TemporaryDirectory() as tmpdir:
-                # Use soffice or libreoffice
-                soffice_cmds = ["soffice", "libreoffice"]
-                chosen = None
-                for cmd in soffice_cmds:
-                    if shutil.which(cmd):
-                        chosen = cmd
-                        break
-                if chosen is None:
-                    # no soffice found
-                    raise EnvironmentError("LibreOffice/soffice not found")
-
-                # run conversion: soffice --headless --convert-to pdf --outdir tmpdir docx_path
-                subprocess.run([chosen, "--headless", "--convert-to", "pdf", "--outdir", tmpdir, docx_path],
-                               check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                base = os.path.splitext(os.path.basename(docx_path))[0] + ".pdf"
-                out_pdf = os.path.join(tmpdir, base)
-                if os.path.exists(out_pdf):
-                    with open(out_pdf, "rb") as f:
-                        data = f.read()
-                    return data
-        except Exception:
-            pass
-
-        # 3) Fallback: cannot convert
-        return None
-
-    # ------------------------ Các hành động ------------------------
-    def _stop_docx_conversion(self):
-        """Dừng/dọn dẹp các worker chuyển đổi DOCX đang chạy."""
-        # Dù không thể hủy luồng, chúng ta xóa các tham chiếu worker để tránh kết nối tín hiệu
-        self._docx_worker_obj = None
-        self._docx_worker_thread = None
-
-    def on_tree_clicked(self, index):
-        # Dừng mọi luồng chuyển đổi DOCX cũ trước khi xử lý mới
-        self._stop_docx_conversion()
-
-        file_path = self.model.filePath(index)
-        if not file_path:
-            return
-
-        if os.path.isdir(file_path):
-            self.lbl_filename.setText(os.path.basename(file_path) or file_path)
-            self.preview.show_text("Thư mục được chọn.")
-            self.lbl_file_info.hide()
-            return
-
-        ext = os.path.splitext(file_path)[1].lower()
-        self.lbl_filename.setText(os.path.basename(file_path))
-        self.lbl_file_info.show()
-        self.current_file = file_path
-        self.btn_open.setEnabled(True)
-
-        try:
-            m_time = datetime.fromtimestamp(os.path.getmtime(file_path))
-            self.lbl_file_info.setText(f"Ngày lưu cuối: {m_time:%d/%m/%Y %H:%M}")
-        except Exception:
-            self.lbl_file_info.hide()
-
-        # TEXT
-        if ext in (".txt", ".py", ".csv", ".log"):
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                self.preview.show_text(f.read())
-
-        # IMAGE
-        elif ext in (".jpg", ".png", ".jpeg", ".bmp", ".gif"):
-            self.preview.show_image(file_path)
-
-        # PDF
-        elif ext == ".pdf":
-            # read bytes and preview
-            try:
-                with open(file_path, "rb") as f:
-                    pdf_bytes = f.read()
-                self.preview.show_pdf_bytes(pdf_bytes)
-            except Exception as e:
-                self.preview.show_text(f"Lỗi đọc PDF: {e}")
-
-        # DOCX -> convert to PDF then preview PDF (preserve formatting)
-        elif ext == ".docx":
-            # Hiển thị trạng thái Loading trước
-            self.preview.show_text("Đang chuyển đổi DOCX sang PDF... Vui lòng chờ.")
-            
-            # Khởi tạo Worker chuyển đổi trong luồng riêng
-            worker = DocxToPdfWorker(file_path, self._convert_docx_to_pdf_bytes)
-            thread = threading.Thread(target=worker.run, daemon=True)
-
-            def on_pdf_ready(pdf_bytes: bytes):
-                # Khi PDF bytes đã sẵn sàng, hiển thị nó
-                self.preview.show_pdf_bytes(pdf_bytes)
-
-            def on_error(msg):
-                # Nếu chuyển đổi thất bại, thử hiển thị văn bản thô
-                if Document:
-                    try:
-                        doc = Document(file_path)
-                        self.preview.show_text(f"Chuyển đổi PDF thất bại ({msg}). Đang hiển thị văn bản thô:\n\n" + "\n\n".join(p.text for p in doc.paragraphs))
-                    except Exception as e:
-                        self.preview.show_text(f"Chuyển đổi PDF thất bại: {msg}\nKhông thể đọc văn bản thô: {e}")
-                else:
-                    self.preview.show_text(f"Chuyển đổi PDF thất bại: {msg}\n(Thiếu thư viện python-docx để đọc văn bản thô).")
-
-            # Kết nối tín hiệu
-            worker.pdf_ready.connect(on_pdf_ready)
-            worker.error.connect(on_error)
-
-            self._docx_worker_obj = worker
-            self._docx_worker_thread = thread
-            thread.start()
-
-        # EXCEL preview as text (existing behavior)
-        elif ext in (".xlsx", ".xls") and openpyxl:
-            try:
-                wb = openpyxl.load_workbook(file_path, data_only=True)
-                ws = wb.active
-                text = "\n".join("\t".join(str(c or "") for c in r) for r in ws.iter_rows(values_only=True))
-                self.preview.show_text(text)
-            except Exception as e:
-                self.preview.show_text(f"Lỗi đọc Excel: {e}")
-
-        # OTHER
-        else:
-            self.preview.show_text("Không hỗ trợ định dạng này.")
+        main_layout.addWidget(splitter)
+        
+        # --- Message Label ---
+        self.message_label = QLabel("Sẵn sàng.")
+        self.message_label.setStyleSheet("padding: 2px; color: gray;")
+        file_panel_layout.addWidget(self.message_label)
 
 
-    def open_file(self):
-        if not self.current_file:
-            return
-        try:
-            if sys.platform.startswith("win"):
-                os.startfile(self.current_file)
-            elif sys.platform == "darwin":
-                subprocess.call(["open", self.current_file])
-            else:
-                subprocess.call(["xdg-open", self.current_file])
-        except Exception as e:
-            QMessageBox.warning(self, "Lỗi", str(e))
+    # --- QUẢN LÝ CACHE VÀ THREADING ---
 
-    def on_search(self):
-        q = self.search_input.text().strip()
+    def start_scan_worker(self, root_path: str):
+        """Khởi tạo và chạy luồng quét file."""
+        # Dọn dẹp luồng cũ nếu đang chạy
+        if self.scan_worker and self.scan_thread and self.scan_thread.isRunning():
+            self.scan_worker.cancel()
+            self.scan_thread.quit()
+            self.scan_thread.wait()
+
+        self.scan_thread = QThread()
+        self.scan_worker = FileScanWorker(root_path)
+        
+        self.scan_worker.moveToThread(self.scan_thread)
+
+        self.scan_thread.started.connect(self.scan_worker.run)
+        self.scan_worker.finished.connect(self._handle_scan_finished)
+        self.scan_worker.error.connect(self._handle_scan_error)
+        
+        self.scan_thread.start()
+
+    def _handle_scan_finished(self, file_cache: List[Dict[str, Any]]):
+        """Xử lý khi worker quét file xong."""
+        self.file_cache = file_cache
+        self.loading_overlay.hide_overlay()
+        self.show_message(f"Tải {len(self.file_cache)} file vào cache thành công.")
+        
+        if self.scan_thread:
+            self.scan_thread.quit()
+            self.scan_thread.wait()
+        
+        # Sau khi tải xong, chạy tìm kiếm nếu có từ khóa
+        self._perform_cache_search(self.search_box.text())
+
+    def _handle_scan_error(self, message: str):
+        """Xử lý khi worker quét file gặp lỗi."""
+        self.loading_overlay.hide_overlay()
+        QMessageBox.critical(self, "Lỗi Quét File", message)
+        if self.scan_thread:
+            self.scan_thread.quit()
+            self.scan_thread.wait()
+
+    def _perform_cache_search(self, search_text: str):
+        """Sử dụng cache để tìm kiếm và cập nhật ListWidget."""
+        search_text = search_text.strip().lower()
         self.search_results_list.clear()
-        if not q:
-            self.search_results_list.hide()
+
+        if not search_text:
+            self.search_results_list.addItem("Nhập từ khóa để tìm kiếm...")
             return
 
-        results = []
-        for root, _, files in os.walk(self.root_folder):
-            for f in files:
-                if q.lower() in f.lower():
-                    results.append(os.path.join(root, f))
+        if not self.file_cache:
+            self.search_results_list.addItem("Đang tải cache... Vui lòng chờ.")
+            return
 
+        # Lọc kết quả từ cache (Search by name or containing directory)
+        results = [
+            info for info in self.file_cache
+            if search_text in info['lower_name'] or search_text in info['dir'].lower()
+        ]
+        
         if not results:
-            self.search_results_list.hide()
+            self.search_results_list.addItem(f"Không tìm thấy file nào cho '{search_text}'.")
             return
 
-        for path in results:
-            item = QListWidgetItem(os.path.basename(path))
-            item.setData(Qt.UserRole, path)
+        # Thêm kết quả vào ListWidget
+        for info in results:
+            item = QListWidgetItem(info['name'])
+            item.setToolTip(info['path'])
+            item.setData(Qt.ItemDataRole.UserRole, info['path']) # Lưu path vào UserRole
             self.search_results_list.addItem(item)
-        self.search_results_list.show()
+            
+        self.show_message(f"Tìm thấy {len(results)} kết quả.")
 
-    def select_from_search(self, item):
-        file_path = item.data(Qt.UserRole)
-        if os.path.exists(file_path):
-            idx = self.model.index(file_path)
-            if idx.isValid():
-                self.tree.setCurrentIndex(idx)
-                self.tree.scrollTo(idx)
-                self.on_tree_clicked(idx)
-        self.search_results_list.hide()
+    def _toggle_tree_list(self, search_text):
+        """Ẩn/Hiện Tree View hoặc List View dựa trên nội dung Search Box."""
+        if search_text.strip():
+            self.tree.setVisible(False)
+            self.search_results_list.setVisible(True)
+        else:
+            self.tree.setVisible(True)
+            self.search_results_list.setVisible(False)
+            self.search_results_list.clear() # Dọn dẹp khi không dùng
 
+    # --- HÀM HỆ THỐNG FILE ---
+
+    def load_root_folder(self, new_root_folder: str):
+        if not os.path.isdir(new_root_folder):
+            QMessageBox.critical(self, "Lỗi", f"Thư mục không hợp lệ: {new_root_folder}")
+            return
+            
+        self.root_folder = new_root_folder
+        self.model.setRootPath(self.root_folder)
+        self.tree.setRootIndex(self.model.index(self.root_folder))
+        
+        # Bắt đầu quét file và hiển thị loading
+        self.loading_overlay.show_overlay() 
+        self.start_scan_worker(self.root_folder)
+        self.show_message(f"Đang quét thư mục: {os.path.basename(new_root_folder)}...")
+
+
+    def refresh_tree(self):
+        # Force refresh QFileSystemModel
+        self.model.setRootPath(self.root_folder)
+        # Tải lại cache
+        self.load_root_folder(self.root_folder) 
+        
     def add_file(self):
         idx = self.tree.currentIndex()
-        target = self.model.filePath(idx) if idx.isValid() else self.root_folder
+        if not idx.isValid():
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn thư mục đích.")
+            return
+        target = self.model.filePath(idx)
         if not os.path.isdir(target):
             target = os.path.dirname(target)
+            
         src, _ = QFileDialog.getOpenFileName(self, "Chọn File để thêm", "", "Tất cả (*.*)")
         if not src:
             return
@@ -564,11 +656,94 @@ class FileManagerWidget(QWidget):
     def change_root(self):
         new_root = QFileDialog.getExistingDirectory(self, "Chọn Thư mục Gốc", self.root_folder)
         if new_root:
-            self.root_folder = new_root
-            self.model.setRootPath(new_root)
-            self.tree.setRootIndex(self.model.index(new_root))
+            self.load_root_folder(new_root)
 
-    def refresh_tree(self):
-        root = self.model.rootPath()
-        self.model.setRootPath(root)
-        self.tree.setRootIndex(self.model.index(root))
+    # --- HÀM XEM TRƯỚC VÀ MỞ FILE ---
+
+    def open_file_with_preview(self, index: QModelIndex):
+        """Mở file khi double click trên Tree View."""
+        path = self.model.filePath(index)
+        if os.path.isfile(path):
+            self.current_file = path
+            self.preview_file(path)
+
+    def open_file_from_list(self, item: QListWidgetItem):
+        """Mở file khi double click trên Search Results List."""
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            self.current_file = path
+            self.preview_file(path)
+
+    def preview_file(self, path):
+        self.preview_panel.clear_preview()
+        
+        # Mở file và lấy bytes
+        try:
+            with open(path, 'rb') as f:
+                file_bytes = f.read()
+        except Exception as e:
+            self.preview_panel.show_text(f"Không thể đọc file: {e}")
+            return
+            
+        file_extension = os.path.splitext(path)[1].lower()
+        
+        # Xử lý xem trước PDF/DOCX
+        if file_extension in ['.pdf']:
+            self.preview_panel.show_multi_page_images(file_bytes, 'application/pdf')
+            
+        elif file_extension in ['.docx', '.doc']:
+             # Nếu có docx2pdf, cố gắng chuyển sang PDF để xem đa trang
+             if docx2pdf is not None and fitz is not None:
+                self.preview_panel.show_multi_page_images(file_bytes, 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+                return
+             
+             # Nếu không có docx2pdf, dùng DocxWorker để lấy text
+             self.docx_thread = QThread()
+             self.docx_worker = DocxWorker(path)
+             self.docx_worker.moveToThread(self.docx_thread)
+             
+             self.docx_thread.started.connect(self.docx_worker.run)
+             self.docx_worker.finished.connect(lambda text: self.preview_panel.show_text(text))
+             self.docx_worker.error.connect(lambda msg: self.preview_panel.show_text(msg))
+             self.preview_panel.show_text("Đang tải file Word...")
+             self.docx_thread.start()
+        
+        # Xử lý xem trước TXT/CSV/CODE
+        elif file_extension in ['.txt', '.csv', '.py', '.js', '.html', '.css', '.json']:
+            try:
+                # Cố gắng decode bằng utf-8
+                text_content = file_bytes.decode('utf-8')
+                self.preview_panel.show_text(text_content)
+            except UnicodeDecodeError:
+                # Nếu không được, thử latin-1
+                text_content = file_bytes.decode('latin-1')
+                self.preview_panel.show_text(f"--- Dữ liệu được decode bằng Latin-1 ---\n{text_content}")
+            except Exception as e:
+                self.preview_panel.show_text("Lỗi đọc file văn bản: " + str(e))
+                
+        # Xử lý xem trước Image
+        elif file_extension in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
+            image = QImage.fromData(file_bytes)
+            self.preview_panel.show_image(image)
+        
+        # Xử lý xem trước Excel (XLSX, XLS)
+        elif file_extension in ['.xlsx', '.xls']:
+            self.excel_thread = QThread()
+            self.excel_worker = ExcelWorker(path)
+            self.excel_worker.moveToThread(self.excel_thread)
+            
+            self.excel_thread.started.connect(self.excel_worker.run)
+            self.excel_worker.finished.connect(lambda text: self.preview_panel.show_text(text))
+            self.excel_worker.error.connect(lambda msg: self.preview_panel.show_text(msg))
+            self.preview_panel.show_text("Đang tải file Excel...")
+            self.excel_thread.start()
+
+        else:
+            self.preview_panel.show_text("Không hỗ trợ xem trước định dạng này.")
+
+    def show_message(self, message: str):
+        """Hiển thị thông báo ở Message Label."""
+        self.message_label.setText(message)
+
+# Đặt LoadingOverlay là lớp con của FileManagerWidget
+# Điều này được xử lý trong __init__ khi self.loading_overlay = LoadingOverlay(self)

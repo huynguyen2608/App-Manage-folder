@@ -4,7 +4,10 @@ import sys
 import re
 from datetime import datetime
 
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, QPushButton, QProgressBar, QMessageBox)
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QLabel, QPushButton, QProgressBar, 
+    QMessageBox, QDialog, QHBoxLayout 
+)
 from PySide6.QtCore import Qt, Signal, QObject, QCoreApplication, QThread, QPoint
 from PySide6.QtGui import QColor, QPalette
 
@@ -22,13 +25,33 @@ except Exception:
     OpenAI = None 
     openai = None 
 
+# --- KHỐI IMPORT PYTHON-DOCX (ĐÃ CẬP NHẬT ĐỂ BẮT LỖI CỤ THỂ) ---
 try:
+    # Lỗi Rgb thường do phiên bản python-docx quá cũ. Lệnh nâng cấp sẽ sửa lỗi này.
     from docx import Document
-    from docx.shared import RGBColor 
+    from docx.shared import RGBColor, Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
-except Exception:
+    
+    # THÊM: Màu Xám nhạt cho chữ dịch (Light Gray)
+    TRANSLATION_COLOR = RGBColor(128, 128, 128)
+    
+except ImportError as e:
+    # Bắt lỗi khi không thể import Rgb
+    print(f"LỖI IMPORT PYTHON-DOCX: {e}. Vui lòng chạy 'pip install --upgrade python-docx'.", file=sys.stderr)
     Document = None
     RGBColor = None
+    Pt = None 
+    Rgb = None
+    TRANSLATION_COLOR = None 
+except Exception as e: 
+    # Bắt các lỗi khác (ví dụ: lỗi nếu Rgb vẫn là None)
+    print(f"LỖI KHÁC KHI IMPORT DOCX: {e}", file=sys.stderr)
+    Document = None
+    RGBColor = None
+    Pt = None 
+    Rgb = None
+    TRANSLATION_COLOR = None
+# ------------------------------------------------------------------
 
 # Thiết lập một hệ thống nhắc (Prompt) rõ ràng cho AI
 SYSTEM_PROMPT = (
@@ -49,7 +72,6 @@ class TranslationWorker(QObject):
         self.file_path = file_path
         self.save_path = save_path
         self.method = method # 'ai' hoặc 'google'
-        # client_or_translator sẽ là OpenAI client HOẶC googletrans Translator
         self.client_or_translator = client_or_translator 
         self._is_cancelled = False
         self.total_items = 0
@@ -98,6 +120,7 @@ class TranslationWorker(QObject):
 
     def run(self):
         if Document is None:
+            # Sẽ chỉ xảy ra nếu import docx thất bại
             self.error.emit("Thiếu thư viện python-docx.")
             self.finished.emit(False)
             return
@@ -117,23 +140,28 @@ class TranslationWorker(QObject):
             return
 
         try:
-            # 1. Đọc file gốc và đếm tổng số đoạn
-            doc = Document(self.file_path)
-            # Chỉ dịch các đoạn có nội dung
-            self.paragraphs = [p for p in doc.paragraphs if p.text.strip()]
-            self.total_items = len(self.paragraphs)
+            # 1. Đọc file gốc
+            src_doc = Document(self.file_path)
+            new_doc = Document() # Tài liệu mới để xây dựng nội dung
 
-            # 2. Tạo bản sao để ghi đè kết quả dịch
-            new_doc = Document()
-            
+            # Lọc các đoạn có nội dung
+            all_paragraphs = [p for p in src_doc.paragraphs if p.text.strip()]
+            self.total_items = len(all_paragraphs)
             self.translated_count = 0
             
-            for i, p_original in enumerate(self.paragraphs):
+            for i, p_original in enumerate(all_paragraphs):
                 if self._is_cancelled:
                     self.finished.emit(False)
                     return
 
-                original_text = p_original.text.strip()
+                original_text = p_original.text
+                
+                # 2. Thêm đoạn gốc (Tiếng Việt) với định dạng gốc
+                p_vn = new_doc.add_paragraph()
+                p_vn.text = original_text
+                # Copy định dạng căn lề và style
+                p_vn.paragraph_format.alignment = p_original.paragraph_format.alignment
+                p_vn.style = p_original.style
                 
                 # 3. Thông báo tiến độ
                 self.translated_count += 1
@@ -146,14 +174,45 @@ class TranslationWorker(QObject):
 
                 # 4. Gọi hàm dịch đã chọn
                 translated_text = translation_func(original_text)
-
-                # 5. Thêm đoạn dịch vào tài liệu mới
-                new_paragraph = new_doc.add_paragraph()
-                new_paragraph.text = translated_text
                 
-                # Copy định dạng căn lề cơ bản
-                if p_original.paragraph_format.alignment is not None:
-                    new_paragraph.paragraph_format.alignment = p_original.paragraph_format.alignment
+                if translated_text:
+                    # 5. Thêm đoạn dịch (Tiếng Anh) ngay bên dưới
+                    p_en = new_doc.add_paragraph()
+                    p_en.style = p_original.style  # Giữ nguyên style đoạn gốc
+
+                    # Sao chép định dạng căn lề, khoảng cách...
+                    pf = p_original.paragraph_format
+                    p_en.paragraph_format.alignment = pf.alignment
+                    p_en.paragraph_format.left_indent = pf.left_indent
+                    p_en.paragraph_format.right_indent = pf.right_indent
+                    p_en.paragraph_format.first_line_indent = pf.first_line_indent
+                    p_en.paragraph_format.space_before = pf.space_before
+                    p_en.paragraph_format.space_after = pf.space_after
+                    p_en.paragraph_format.line_spacing = pf.line_spacing
+
+                    # --- Sao chép định dạng chữ từ các "run" trong đoạn gốc ---
+                    if p_original.runs:
+                        # Nếu có nhiều run, copy font định dạng từ run đầu tiên
+                        for run_orig in p_original.runs:
+                            run_new = p_en.add_run(translated_text)
+                            # Sao chép định dạng gốc
+                            run_new.bold = run_orig.bold
+                            run_new.underline = run_orig.underline
+                            run_new.font.name = run_orig.font.name
+                            run_new.font.size = run_orig.font.size
+                            # Chỉ khác biệt: nghiêng và màu xám
+                            run_new.italic = True
+                            if TRANSLATION_COLOR:
+                                run_new.font.color.rgb = TRANSLATION_COLOR
+                            break  # chỉ cần lấy format từ run đầu tiên
+                    else:
+                        # Nếu đoạn gốc không có run
+                        run_new = p_en.add_run(translated_text)
+                        run_new.italic = True
+                        if TRANSLATION_COLOR:
+                            run_new.font.color.rgb = TRANSLATION_COLOR
+
+                        
                 
             # 6. Lưu file
             new_doc.save(self.save_path)
@@ -165,15 +224,18 @@ class TranslationWorker(QObject):
             self.finished.emit(False)
 
 
-# --- Code cho CustomProgressDialog ---
+# --- CustomProgressDialog và các lớp UI liên quan (GIỮ NGUYÊN) ---
 
-class CustomProgressDialog(QWidget):
+class CustomProgressDialog(QDialog):
     canceled = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedSize(400, 150)
         self.setWindowTitle("Xử lý Dịch Thuật")
+        
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
         layout = QVBoxLayout(self)
         
@@ -191,7 +253,7 @@ class CustomProgressDialog(QWidget):
         
         self.btn_cancel = QPushButton("Hủy") 
         self.btn_cancel.setFixedWidth(100)
-        self.btn_cancel.clicked.connect(self.canceled.emit)
+        self.btn_cancel.clicked.connect(self.reject) 
         
         layout.addWidget(self.lbl_title, alignment=Qt.AlignCenter)
         layout.addWidget(self.lbl_status)
@@ -209,7 +271,7 @@ class CustomProgressDialog(QWidget):
         self.lbl_status.setText(text)
 
     def closeEvent(self, event):
-        event.ignore()
+        event.ignore() 
 
 class LoadingOverlay(QWidget):
     def __init__(self, parent=None):
@@ -234,7 +296,6 @@ class TranslationHandler(QObject):
         self.worker_thread = None
         self.worker = None
         
-        # KHỞI TẠO CẢ HAI CLIENT
         self.openai_client = None
         self.google_translator = None
 
@@ -246,20 +307,16 @@ class TranslationHandler(QObject):
 
         try:
             if Translator:
-                # Khởi tạo googletrans Translator
                 self.google_translator = Translator()
         except Exception as e:
             print(f"CẢNH BÁO: Không thể khởi tạo Google Translator. Lỗi: {e}")
 
 
         self.progress_dialog = CustomProgressDialog(main_window)
-        self.progress_dialog.hide()
-        self.progress_dialog.canceled.connect(self._handle_cancellation)
 
     def is_available(self, method: str):
-        # Kiểm tra tính khả dụng dựa trên phương thức được chọn
         if Document is None:
-            return False, "Thiếu python-docx."
+            return False, "Thiếu thư viện python-docx."
             
         if method == 'ai':
             if self.openai_client is not None:
@@ -278,18 +335,15 @@ class TranslationHandler(QObject):
         if not is_ok:
             QMessageBox.critical(self.main_window, "Thiếu Thiết lập", f"Lỗi: {msg}")
             return
+            
+        self.progress_dialog.rejected.connect(self._handle_cancellation) 
 
-        self.progress_dialog.show()
-        
-        self.worker_thread = QThread()
-        
-        # Chọn client/translator
         if method == 'ai':
             client_or_translator = self.openai_client
         elif method == 'google':
             client_or_translator = self.google_translator
         
-        # Khởi tạo worker với phương thức và client/translator tương ứng
+        self.worker_thread = QThread()
         self.worker = TranslationWorker(file_path, save_path, method, client_or_translator)
         self.worker.moveToThread(self.worker_thread)
 
@@ -299,15 +353,17 @@ class TranslationHandler(QObject):
         self.worker.progress_update.connect(self.progress_dialog.update_progress)
         
         self.worker_thread.start()
+        
+        self.progress_dialog.exec() 
 
     def _handle_cancellation(self):
         if self.worker:
             self.worker.cancel()
-            QMessageBox.information(self.main_window, "Hủy", "Đang chờ luồng dịch kết thúc.")
+            QMessageBox.information(self.main_window, "Hủy", "Đang chờ luồng dịch kết thúc...")
 
     def _handle_completion(self, success: bool):
         self._cleanup_worker()
-        self.progress_dialog.hide()
+        self.progress_dialog.hide() 
         if success:
             QMessageBox.information(self.main_window, "Hoàn thành", f"Hợp đồng đã được dịch và lưu thành công.")
         elif self.worker is not None and not self.worker._is_cancelled:
@@ -316,7 +372,7 @@ class TranslationHandler(QObject):
 
     def _handle_error(self, message: str):
         self._cleanup_worker()
-        self.progress_dialog.hide()
+        self.progress_dialog.hide() 
         QMessageBox.critical(self.main_window, "Lỗi Dịch Thuật", message)
 
     def _cleanup_worker(self):

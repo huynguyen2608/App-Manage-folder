@@ -11,6 +11,7 @@ from typing import List, Dict, Any
 from ui.contract_template_widget import ContractTemplateWidget
 from ui.progress_tracking_widget import ExcelEditor
 from ui.file_manager_widget import CustomFileSystemModel, PreviewWidget, FileManagerWidget
+# Giả định TranslationHandler, TranslationWorker, LoadingOverlay, CustomProgressDialog nằm ở đây
 from ui.translation_handlers import TranslationHandler, TranslationWorker, LoadingOverlay, CustomProgressDialog
 
 from PySide6.QtWidgets import (
@@ -292,10 +293,11 @@ class MainWindow(QMainWindow):
         t_contract.setStyleSheet("QWidget { background-color: #f7f9fc; }") # Đồng nhất màu nền
         contract_layout = QVBoxLayout(t_contract)
         contract_layout.setContentsMargins(0, 0, 0, 0)
-        self.contract_widget = ContractTemplateWidget()
+        # SỬA LỖI: Truyền translation_handler và parent
+        self.contract_widget = ContractTemplateWidget(self.translation_handler, parent=self) 
         contract_layout.addWidget(self.contract_widget)
         
-        # KẾT NỐI TÍN HIỆU DỊCH TỪ WIDGET CON
+        # KẾT NỐI TÍN HIỆU DỊCH TỪ WIDGET CON (Đã cập nhật)
         self.contract_widget.translation_start_signal.connect(self.start_translation)
         
         tabs.addTab(t_contract, style.standardIcon(QStyle.SP_FileLinkIcon), "Mẫu hợp đồng")
@@ -311,7 +313,7 @@ class MainWindow(QMainWindow):
         self.progress_dialog_content = CustomProgressDialog(self)
         self.progress_dialog_content.hide()
         # KẾT NỐI NÚT HỦY CỦA DIALOG VỚI HÀM HỦY
-        self.progress_dialog_content.canceled.connect(self.cancel_translation)
+        self.progress_dialog_content.canceled.connect(self.translation_handler._handle_cancellation) # ĐÃ SỬA KẾT NỐI
         
         # Connection to handle window movement (Loading popup follows the app)
         self.recenter_timer = QTimer(self)
@@ -336,10 +338,12 @@ class MainWindow(QMainWindow):
         return QPoint(new_x, new_y)
 
     def recenter_loading_dialog(self):
-        if self.progress_dialog_content.isVisible():
+        # SỬ DỤNG progress_dialog của TranslationHandler nếu có
+        dialog = self.translation_handler.progress_dialog
+        if dialog.isVisible():
             # Tính toán và di chuyển dialog
-            new_pos = self.get_centered_pos(self.progress_dialog_content.size())
-            self.progress_dialog_content.move(new_pos)
+            new_pos = self.get_centered_pos(dialog.size())
+            dialog.move(new_pos)
 
     def on_main_window_resize_or_move(self, event):
         # Resize overlay (Phủ hết cửa sổ chính)
@@ -354,18 +358,16 @@ class MainWindow(QMainWindow):
     # ----------------------------------------------
     # PHƯƠNG THỨC: XỬ LÝ DỊCH (TRANSLATION HANDLERS)
     # ----------------------------------------------
-    def start_translation(self, file_path, save_path):
-        self.translation_handler.start_translation(file_path, save_path, self.contract_widget.translator)
+    # KHẮC PHỤC LỖI: Cần 3 tham số (file_path, save_path, translator_engine)
+    def start_translation(self, file_path, save_path, translator_engine):
+        # Sử dụng tham số translator_engine thay vì self.contract_widget.translator (đã bị xóa)
+        # Giả định translation_handler được cấu hình để hiển thị popup
+        self.translation_handler.start_translation(file_path, save_path, translator_engine)
 
-    def cancel_translation(self):
-        self.translation_handler.cancel_translation()
+    # ĐÃ XÓA: cancel_translation (đã được kết nối trực tiếp đến TranslationHandler)
+    # ĐÃ XÓA: on_translation_error (đã được xử lý bởi TranslationHandler)
+    # ĐÃ XÓA: on_translation_finished (đã được xử lý bởi TranslationHandler)
 
-    def on_translation_error(self, msg):
-        pass  # Handled by TranslationHandler
-
-    def on_translation_finished(self, success):
-        if success:
-            self.contract_widget.load_templates()
 
     # ----------------------------------------------
     # CÁC PHƯƠNG THỨC KHÁC
@@ -676,9 +678,12 @@ class MainWindow(QMainWindow):
             elif ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
                 self.preview.show_image(file_path)
             elif ext == ".pdf":
-                with open(file_path, "rb") as f:
-                    b = f.read()
-                self.preview.show_pdf_bytes(b)
+                if fitz is None:
+                    self.preview.show_text("Thiếu thư viện 'PyMuPDF' (fitz). Không thể xem trước PDF.")
+                else:
+                    with open(file_path, "rb") as f:
+                        b = f.read()
+                    self.preview.show_pdf_bytes(b)
             elif ext == ".docx":
                 if Document is None:
                     self.preview.show_text("python-docx chưa cài. Cài 'python-docx' để xem .docx.")
